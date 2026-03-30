@@ -1,0 +1,831 @@
+import { createServer } from "node:http";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import next from "next";
+import { Server } from "socket.io";
+import { setIO } from "./lib/socket";
+import {
+  getSession,
+  addTodos,
+  assignTask,
+  completeTask,
+  getNextPendingTask,
+  updateAgentStatus,
+  updateAgentStreamUrl,
+  updateWhiteboard,
+  getWhiteboard,
+  updateAgentThumbnail,
+  updateAgentSandboxId,
+  restoreSessionFromDb,
+} from "./lib/session-store";
+import { respawnWorker } from "./lib/worker-manager";
+import type {
+  ServerToClientEvents,
+  ClientToServerEvents,
+  AgentJoinEvent,
+  AgentStreamReadyEvent,
+  AgentThinkingEvent,
+  AgentReasoningEvent,
+  AgentErrorEvent,
+  TaskCompletedEvent,
+  AgentTerminatedEvent,
+  WhiteboardUpdatedEvent,
+  SessionFollowUpEvent,
+  ReplayCompleteEvent,
+  AgentThumbnailEvent,
+  AgentSandboxReadyEvent,
+  AgentHeartbeatEvent,
+  AgentPausedEvent,
+  AgentSandboxExpiredEvent,
+  AgentCheckpointEvent,
+} from "./lib/types";
+import {
+  persistTodoStatus,
+  persistTodos,
+  persistSessionStatus,
+  persistAgentSandboxId,
+  persistAgentHeartbeat,
+  getSessionWithDetails,
+} from "./lib/db/session-persist";
+import { persistReplay } from "./lib/db/replay-persist";
+import { decomposeTasks } from "./lib/orchestrator";
+import {
+  createSlackApp,
+  getSlackApp,
+  postMilestoneToSlack,
+  postCompletionToSlack,
+  postErrorToSlack,
+  postCheckpointToSlack,
+} from "./lib/slack/app";
+import { summarizeActions, type BufferedAction } from "./lib/slack/summarize-actions";
+import {
+  getSlackSessionBySessionId,
+  completeSlackSession,
+} from "./lib/slack/session-adapter";
+
+const dev = process.env.NODE_ENV !== "production";
+const hostname = "localhost";
+const port = parseInt(process.env.PORT || "3000", 10);
+
+const app = next({ dev, hostname, port });
+const handler = app.getRequestHandler();
+
+/** 5-minute idle shutdown timers, keyed by sessionId */
+const idleTimers = new Map<string, NodeJS.Timeout>();
+/** Safety timers for sessions being stopped, keyed by sessionId */
+const stopTimers = new Map<string, NodeJS.Timeout>();
+/** Sessions waiting for workers to finish cleanup before completing */
+const stoppingSessions = new Set<string>();
+
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const STOP_TIMEOUT_MS = 30 * 1000; // 30 seconds max wait for worker cleanup
+const SLACK_MILESTONE_THROTTLE_MS = 30_000; // Min 30s between Slack milestone posts per session
+
+/** Last Slack milestone post time per sessionId, for throttling */
+const lastSlackMilestone = new Map<string, number>();
+
+/** Recent reasoning entries per agent (ring buffer of 5), used for checkpoint summaries */
+const lastReasoningsByAgent = new Map<string, string[]>();
+
+/** Buffered tool actions per session, for LLM milestone summaries */
+const actionBuffer = new Map<string, BufferedAction[]>();
+
+app.prepare().then(() => {
+  const httpServer = createServer(handler);
+
+  const io = new Server<ClientToServerEvents, ServerToClientEvents>(
+    httpServer,
+    {
+      cors: {
+        origin: "*",
+      },
+    }
+  );
+
+  setIO(io);
+
+  // --- Start Slack bot (if configured) ---
+  if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
+    const slack = createSlackApp();
+    slack.start().then(() => {
+      console.log("[server] Slack bot started (Socket Mode)");
+    }).catch((err) => {
+      console.error("[server] Failed to start Slack bot:", err);
+    });
+  } else {
+    console.log("[server] Slack bot disabled (SLACK_BOT_TOKEN / SLACK_APP_TOKEN not set)");
+  }
+
+  /**
+   * Start (or restart) the 5-minute idle shutdown timer for a session.
+   * When the timer fires, the session truly completes.
+   */
+  function startIdleTimer(sessionId: string): void {
+    // Clear any existing timer
+    clearIdleTimer(sessionId);
+
+    console.log(
+      `[server] Session ${sessionId} — starting 5-min idle shutdown timer`
+    );
+
+    const timer = setTimeout(() => {
+      idleTimers.delete(sessionId);
+      pauseSession(sessionId);
+    }, IDLE_TIMEOUT_MS);
+
+    idleTimers.set(sessionId, timer);
+  }
+
+  function clearIdleTimer(sessionId: string): void {
+    const existing = idleTimers.get(sessionId);
+    if (existing) {
+      clearTimeout(existing);
+      idleTimers.delete(sessionId);
+      console.log(
+        `[server] Session ${sessionId} — cleared idle shutdown timer`
+      );
+    }
+  }
+
+  /**
+   * Pause a session: set status to "paused", tell workers to stop (they'll pause sandboxes).
+   * The session remains resumable — visiting the URL will respawn workers.
+   */
+  function pauseSession(sessionId: string): void {
+    const session = getSession(sessionId);
+    if (!session || session.status === "completed" || session.status === "failed" || session.status === "paused") return;
+
+    const room = `session:${sessionId}`;
+    session.status = "paused";
+
+    // Tell workers to stop — they'll pause sandboxes in their finally block
+    io.to(room).emit("task:none");
+
+    // Notify dashboard
+    io.to("dashboard").emit("dashboard:session_updated", {
+      sessionId,
+      status: "paused" as const,
+      completedTasks: session.todos.filter((t) => t.status === "completed").length,
+      totalTasks: session.todos.length,
+    });
+
+    console.log(`[server] Session ${sessionId} — paused (idle timeout)`);
+    persistSessionStatus(sessionId, "paused").catch(console.error);
+  }
+
+  /**
+   * Finalize a session: set status to completed, emit session:complete,
+   * tell workers to stop, and persist.
+   */
+  function finalizeSession(sessionId: string): void {
+    const session = getSession(sessionId);
+    if (!session || session.status === "completed" || session.status === "failed") return;
+
+    const room = `session:${sessionId}`;
+    session.status = "completed";
+
+    io.to(room).emit("session:complete", { sessionId });
+    io.to(room).emit("task:none");
+
+    // Notify dashboard
+    io.to("dashboard").emit("dashboard:session_updated", {
+      sessionId,
+      status: "completed" as const,
+      completedTasks: session.todos.filter((t) => t.status === "completed").length,
+      totalTasks: session.todos.length,
+    });
+
+    console.log(`[server] Session ${sessionId} — finalized (idle timeout or manual)`);
+
+    persistSessionStatus(sessionId, "completed", new Date()).catch(
+      console.error
+    );
+
+    // Slack notification already posted when tasks completed (see task:completed handler)
+  }
+
+  /**
+   * Complete a session that was stopped by the user, after workers have
+   * finished saving replays (or the safety timeout fired).
+   */
+  function completeStoppedSession(sessionId: string): void {
+    stoppingSessions.delete(sessionId);
+    const existingTimeout = stopTimers.get(sessionId);
+    if (existingTimeout) {
+      clearTimeout(existingTimeout);
+      stopTimers.delete(sessionId);
+    }
+
+    const session = getSession(sessionId);
+    if (!session) return;
+
+    // Mark any remaining agents as terminated
+    session.agents.forEach((agent) => {
+      if (agent.status !== "terminated") {
+        updateAgentStatus(sessionId, agent.id, "terminated");
+        io.to(`session:${sessionId}`).emit("agent:terminated", {
+          agentId: agent.id,
+        });
+      }
+    });
+
+    session.status = "completed";
+    io.to(`session:${sessionId}`).emit("session:complete", { sessionId });
+
+    // Notify dashboard
+    io.to("dashboard").emit("dashboard:session_updated", {
+      sessionId,
+      status: "completed" as const,
+      completedTasks: session.todos.filter((t) => t.status === "completed").length,
+      totalTasks: session.todos.length,
+    });
+
+    persistSessionStatus(sessionId, "completed", new Date()).catch(
+      console.error
+    );
+
+    console.log(`[server] Session ${sessionId} — stopped session completed`);
+  }
+
+  /**
+   * Assign tasks to idle agents in a session. Used both after initial
+   * stream_ready and after follow-up decomposition.
+   */
+  function assignTasksToIdleAgents(sessionId: string): void {
+    const session = getSession(sessionId);
+    if (!session) return;
+
+    const idleAgents = session.agents.filter(
+      (a) => a.status === "idle" || a.status === "active"
+    ).filter((a) => !a.currentTaskId);
+
+    for (const agent of idleAgents) {
+      const nextTask = getNextPendingTask(sessionId, agent.id);
+      if (!nextTask) break;
+
+      assignTask(sessionId, nextTask.id, agent.id);
+      io.to(`session:${sessionId}`).emit("task:assigned", {
+        todoId: nextTask.id,
+        agentId: agent.id,
+      });
+
+      // Send task to the specific worker socket
+      const whiteboard = getWhiteboard(sessionId);
+      const room = `session:${sessionId}`;
+      io.to(room).emit("task:assign", {
+        taskId: nextTask.id,
+        description: nextTask.description,
+        whiteboard,
+      });
+    }
+  }
+
+  io.on("connection", (socket) => {
+    console.log(`[socket.io] Client connected: ${socket.id}`);
+
+    // --- Dashboard room events ---
+    socket.on("dashboard:join", () => {
+      socket.join("dashboard");
+      console.log(`[socket.io] ${socket.id} joined dashboard room`);
+    });
+
+    socket.on("dashboard:leave", () => {
+      socket.leave("dashboard");
+      console.log(`[socket.io] ${socket.id} left dashboard room`);
+    });
+
+    // --- Browser client events ---
+    socket.on("session:join", async (sessionId) => {
+      socket.join(`session:${sessionId}`);
+      console.log(`[socket.io] ${socket.id} joined session:${sessionId}`);
+
+      // If session not in memory, try to recover from DB
+      const existing = getSession(sessionId);
+      if (!existing) {
+        try {
+          const dbSession = await getSessionWithDetails(sessionId);
+          if (dbSession) {
+            const restored = restoreSessionFromDb(dbSession);
+            console.log(`[server] Session ${sessionId} — restored from DB (status: ${restored.status})`);
+
+            // If session was running or paused, respawn workers with sandbox IDs
+            if (restored.status === "running" || restored.status === "paused") {
+              for (const agent of restored.agents) {
+                if (agent.sandboxId && (agent.status === "paused" || agent.status === "active" || agent.status === "idle")) {
+                  respawnWorker(sessionId, agent);
+                  console.log(`[server] Respawning worker for agent ${agent.id} (sandbox: ${agent.sandboxId})`);
+                }
+              }
+              if (restored.status === "paused") {
+                restored.status = "running";
+                persistSessionStatus(sessionId, "running").catch(console.error);
+              }
+            }
+          }
+        } catch (err) {
+          console.error(`[server] Failed to recover session ${sessionId} from DB:`, err);
+        }
+      }
+    });
+
+    socket.on("session:leave", (sessionId) => {
+      socket.leave(`session:${sessionId}`);
+      console.log(`[socket.io] ${socket.id} left session:${sessionId}`);
+    });
+
+    socket.on("session:stop", (data: { sessionId: string }) => {
+      const { sessionId } = data;
+      const session = getSession(sessionId);
+      if (!session) return;
+
+      console.log(`[socket.io] Stopping session ${sessionId}`);
+
+      // Clear any idle timer
+      clearIdleTimer(sessionId);
+
+      // Track that this session is stopping — workers need time to save replays
+      stoppingSessions.add(sessionId);
+
+      // Tell all workers to force-kill sandboxes (not pause)
+      io.to(`session:${sessionId}`).emit("session:stop", { sessionId });
+      io.to(`session:${sessionId}`).emit("task:none");
+
+      // Safety timeout: if workers don't finish in time, force-complete
+      const timeout = setTimeout(() => {
+        stopTimers.delete(sessionId);
+        if (stoppingSessions.has(sessionId)) {
+          console.log(`[server] Session ${sessionId} — stop timeout, force-completing`);
+          completeStoppedSession(sessionId);
+        }
+      }, STOP_TIMEOUT_MS);
+      stopTimers.set(sessionId, timeout);
+
+      console.log(`[server] Session ${sessionId} — waiting for workers to save replays`);
+    });
+
+    socket.on("session:finish", (data: { sessionId: string }) => {
+      const { sessionId } = data;
+      console.log(`[socket.io] Finishing session ${sessionId}`);
+      clearIdleTimer(sessionId);
+      finalizeSession(sessionId);
+    });
+
+    // --- Follow-up instructions from browser ---
+    socket.on("session:followup", async (data: SessionFollowUpEvent) => {
+      const { sessionId, prompt } = data;
+      const session = getSession(sessionId);
+      if (!session || session.status === "completed" || session.status === "failed") return;
+
+      console.log(
+        `[server] Session ${sessionId} — received follow-up: "${prompt}"`
+      );
+
+      // Clear the idle timer since new work is coming
+      clearIdleTimer(sessionId);
+
+      // Decompose the follow-up prompt
+      try {
+        const idleAgentCount = session.agents.filter(
+          (a) => a.status === "idle" || a.status === "active"
+        ).filter((a) => !a.currentTaskId).length;
+        const targetCount = Math.max(idleAgentCount, 1);
+
+        const decomposed = await decomposeTasks(prompt, targetCount);
+        const newTodos = addTodos(sessionId, decomposed);
+
+        // Persist new todos
+        persistTodos(sessionId, newTodos).catch(console.error);
+
+        // Emit task:created for each new todo
+        const room = `session:${sessionId}`;
+        for (const todo of newTodos) {
+          io.to(room).emit("task:created", todo);
+        }
+
+        // Assign new tasks to idle agents
+        assignTasksToIdleAgents(sessionId);
+
+        console.log(
+          `[server] Session ${sessionId} — follow-up decomposed into ${newTodos.length} tasks`
+        );
+      } catch (error) {
+        console.error(
+          `[server] Session ${sessionId} — failed to decompose follow-up:`,
+          error
+        );
+      }
+    });
+
+    // --- Worker events ---
+
+    socket.on("agent:join", (data: AgentJoinEvent) => {
+      const { sessionId, agentId } = data;
+      socket.join(`session:${sessionId}`);
+      console.log(`[socket.io] Worker ${agentId} joined session:${sessionId}`);
+
+      // Forward to browser clients
+      const room = `session:${sessionId}`;
+      io.to(room).emit("agent:join", { agentId, sessionId });
+    });
+
+    socket.on("agent:stream_ready", (data: AgentStreamReadyEvent) => {
+      // Find session from rooms
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      const { agentId, streamUrl } = data;
+      updateAgentStreamUrl(sessionId, agentId, streamUrl);
+      updateAgentStatus(sessionId, agentId, "active");
+
+      // Forward to browser clients
+      io.to(`session:${sessionId}`).emit("agent:stream_ready", {
+        agentId,
+        streamUrl,
+      });
+
+      // Assign first task to this agent
+      const nextTask = getNextPendingTask(sessionId, agentId);
+      if (nextTask) {
+        assignTask(sessionId, nextTask.id, agentId);
+        io.to(`session:${sessionId}`).emit("task:assigned", {
+          todoId: nextTask.id,
+          agentId,
+        });
+
+        // Send task to worker
+        const whiteboard = getWhiteboard(sessionId);
+        socket.emit("task:assign", {
+          taskId: nextTask.id,
+          description: nextTask.description,
+          whiteboard,
+        });
+      }
+      // Agent idles if no pending tasks — don't terminate
+    });
+
+    socket.on("agent:thinking", (data: AgentThinkingEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      io.to(`session:${sessionId}`).emit("agent:thinking", {
+        agentId: data.agentId,
+        action: data.action,
+        timestamp: data.timestamp || new Date().toISOString(),
+        isError: data.isError,
+        actionId: data.actionId,
+        toolName: data.toolName,
+        toolArgs: data.toolArgs,
+      });
+
+      // Buffer tool actions for LLM-summarized Slack milestones (per agent)
+      if (data.toolName && data.toolName !== "screenshot" && getSlackSessionBySessionId(sessionId)) {
+        const agentKey = `${sessionId}:${data.agentId}`;
+        const buf = actionBuffer.get(agentKey) ?? [];
+        buf.push({
+          tool: data.toolName,
+          args: data.toolArgs as Record<string, unknown> | undefined,
+        });
+        actionBuffer.set(agentKey, buf);
+
+        // When throttle fires, summarize this agent's buffered actions and post to Slack
+        const now = Date.now();
+        const last = lastSlackMilestone.get(agentKey) || 0;
+        if (now - last >= SLACK_MILESTONE_THROTTLE_MS) {
+          lastSlackMilestone.set(agentKey, now);
+          const session = getSession(sessionId);
+          const agent = session?.agents.find((a) => a.id === data.agentId);
+          const agentName = agent?.name || `Agent ${data.agentId.slice(0, 6)}`;
+
+          // Drain this agent's buffer and summarize via Haiku
+          const actions = actionBuffer.get(agentKey) ?? [];
+          actionBuffer.set(agentKey, []);
+
+          summarizeActions(actions)
+            .then((summary) => postMilestoneToSlack(sessionId, agentName, summary))
+            .catch(console.error);
+        }
+      }
+    });
+
+    socket.on("agent:reasoning", (data: AgentReasoningEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      // Buffer reasoning in ring buffer (last 5) for checkpoint summaries
+      const reasoningBufKey = `${sessionId}:${data.agentId}`;
+      const reasoningEntries = lastReasoningsByAgent.get(reasoningBufKey) ?? [];
+      reasoningEntries.push(data.reasoning);
+      if (reasoningEntries.length > 5) reasoningEntries.shift();
+      lastReasoningsByAgent.set(reasoningBufKey, reasoningEntries);
+
+      // Attach reasoning to the most recent buffered action for richer LLM context
+      const agentBufKey = `${sessionId}:${data.agentId}`;
+      const buf = actionBuffer.get(agentBufKey);
+      if (buf && buf.length > 0) {
+        buf[buf.length - 1].reasoning = data.reasoning;
+      }
+
+      io.to(`session:${sessionId}`).emit("agent:reasoning", {
+        agentId: data.agentId,
+        reasoning: data.reasoning,
+        timestamp: data.timestamp || new Date().toISOString(),
+        actionId: data.actionId,
+      });
+    });
+
+    socket.on("agent:thumbnail", (data: AgentThumbnailEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      updateAgentThumbnail(sessionId, data.agentId, data.thumbnail);
+      io.to("dashboard").emit("thumbnail:update", {
+        sessionId,
+        agentId: data.agentId,
+        thumbnail: data.thumbnail,
+        timestamp: new Date().toISOString(),
+      });
+    });
+
+    socket.on("agent:sandbox_ready", (data: AgentSandboxReadyEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      const { agentId, sandboxId } = data;
+      updateAgentSandboxId(sessionId, agentId, sandboxId);
+      persistAgentSandboxId(agentId, sandboxId).catch(console.error);
+      console.log(`[socket.io] Agent ${agentId} sandbox ready: ${sandboxId}`);
+    });
+
+    socket.on("agent:heartbeat", (data: AgentHeartbeatEvent) => {
+      const { agentId } = data;
+      persistAgentHeartbeat(agentId).catch(console.error);
+    });
+
+    socket.on("agent:paused", (data: AgentPausedEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      const { agentId, sandboxId } = data;
+      updateAgentStatus(sessionId, agentId, "paused");
+      updateAgentSandboxId(sessionId, agentId, sandboxId);
+      persistAgentSandboxId(agentId, sandboxId).catch(console.error);
+      io.to(`session:${sessionId}`).emit("agent:paused", { agentId, sandboxId });
+
+      // If all agents are paused, pause the session
+      const session = getSession(sessionId);
+      if (session && session.agents.every((a) => a.status === "paused" || a.status === "terminated" || a.status === "expired")) {
+        session.status = "paused";
+        persistSessionStatus(sessionId, "paused").catch(console.error);
+        console.log(`[server] Session ${sessionId} — all agents paused, session paused`);
+      }
+    });
+
+    socket.on("agent:sandbox_expired", (data: AgentSandboxExpiredEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      const { agentId } = data;
+      updateAgentStatus(sessionId, agentId, "expired");
+      io.to(`session:${sessionId}`).emit("agent:sandbox_expired", { agentId });
+      console.log(`[server] Agent ${agentId} sandbox expired`);
+    });
+
+    socket.on("agent:checkpoint", (data: AgentCheckpointEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      const slackSession = getSlackSessionBySessionId(sessionId);
+      if (!slackSession) return;
+
+      const session = getSession(sessionId);
+      const agent = session?.agents.find((a) => a.id === data.agentId);
+      const agentName = agent?.name || `Agent ${data.agentId.slice(0, 8)}`;
+
+      // Build accomplishment summary from recent reasoning entries
+      const reasoningKey = `${sessionId}:${data.agentId}`;
+      const recentReasoning = lastReasoningsByAgent.get(reasoningKey) ?? [];
+      const accomplishmentSummary = recentReasoning.join(" ").slice(0, 300) || undefined;
+
+      postCheckpointToSlack(
+        sessionId,
+        agentName,
+        data.step,
+        data.totalSteps,
+        data.thumbnail,
+        accomplishmentSummary,
+      ).catch(console.error);
+    });
+
+    socket.on("agent:error", (data: AgentErrorEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      updateAgentStatus(sessionId, data.agentId, "error");
+      io.to(`session:${sessionId}`).emit("agent:error", {
+        agentId: data.agentId,
+        error: data.error,
+      });
+
+      // Post error to Slack for human-in-the-loop recovery
+      if (getSlackSessionBySessionId(sessionId)) {
+        postErrorToSlack(sessionId, data.error).catch(console.error);
+      }
+    });
+
+    socket.on("task:completed", (data: TaskCompletedEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      const { todoId, agentId, result } = data;
+      completeTask(sessionId, todoId, result);
+
+      // Persist todo completion to database
+      persistTodoStatus(todoId, "completed", result).catch(console.error);
+
+      io.to(`session:${sessionId}`).emit("task:completed", {
+        todoId,
+        agentId,
+        result,
+      });
+
+      // Notify dashboard of progress
+      {
+        const session = getSession(sessionId);
+        if (session) {
+          const completedTasks = session.todos.filter(
+            (t) => t.status === "completed"
+          ).length;
+          io.to("dashboard").emit("dashboard:session_updated", {
+            sessionId,
+            status: session.status,
+            completedTasks,
+            totalTasks: session.todos.length,
+          });
+        }
+      }
+
+      // Try to assign next task
+      const nextTask = getNextPendingTask(sessionId, agentId);
+      if (nextTask) {
+        assignTask(sessionId, nextTask.id, agentId);
+        io.to(`session:${sessionId}`).emit("task:assigned", {
+          todoId: nextTask.id,
+          agentId,
+        });
+
+        const whiteboard = getWhiteboard(sessionId);
+        socket.emit("task:assign", {
+          taskId: nextTask.id,
+          description: nextTask.description,
+          whiteboard,
+        });
+      } else if (isSessionFullyComplete(sessionId)) {
+        // All tasks done — emit tasks_done, start idle timer
+        const room = `session:${sessionId}`;
+        io.to(room).emit("session:tasks_done", { sessionId });
+        console.log(
+          `[server] Session ${sessionId} — all tasks completed, agents idling`
+        );
+
+        // Start 5-min idle timer (agents stay alive for follow-ups)
+        startIdleTimer(sessionId);
+
+        // Post completion to Slack immediately and shut down workers
+        // so the GIF saves and uploads without waiting for the 5-min idle timer
+        const slackSession = getSlackSessionBySessionId(sessionId);
+        if (slackSession) {
+          const whiteboard = getWhiteboard(sessionId);
+          const todoCount = getSession(sessionId)?.todos.length ?? 0;
+          postCompletionToSlack({
+            sessionId,
+            threadTs: slackSession.threadTs,
+            channelId: slackSession.channelId,
+            summary: whiteboard || `Completed ${todoCount} task(s).`,
+          }).catch(console.error);
+          completeSlackSession(slackSession.threadTs, slackSession.channelId).catch(
+            console.error
+          );
+
+          // Tell workers to shut down now — triggers finally block which saves GIF
+          clearIdleTimer(sessionId);
+          io.to(room).emit("task:none");
+        }
+      }
+      // Otherwise: no pending tasks but session not complete — agent idles
+    });
+
+    socket.on("whiteboard:updated", (data: WhiteboardUpdatedEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      // Append to whiteboard (agents append, not overwrite)
+      const current = getWhiteboard(sessionId);
+      const updated = current + data.content;
+      updateWhiteboard(sessionId, updated);
+
+      io.to(`session:${sessionId}`).emit("whiteboard:updated", {
+        sessionId,
+        content: updated,
+      });
+    });
+
+    socket.on("replay:complete", async (data: ReplayCompleteEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      const { agentId, manifestUrl, frameCount } = data;
+      console.log(
+        `[server] Session ${sessionId} — replay uploaded for agent ${agentId} (${frameCount} frames)`
+      );
+
+      // Persist to database
+      persistReplay(sessionId, agentId, manifestUrl, frameCount).catch(
+        console.error
+      );
+
+      // Broadcast to browser clients
+      io.to(`session:${sessionId}`).emit("replay:ready", {
+        agentId,
+        manifestUrl,
+        frameCount,
+      });
+
+      // Upload GIF to Slack thread if this session is linked
+      const slackSession = getSlackSessionBySessionId(sessionId);
+      if (slackSession) {
+        const replayDir = process.env.REPLAY_DIR || resolve(process.cwd(), ".replays");
+        const agentGif = resolve(replayDir, sessionId, agentId, "timelapse.gif");
+        if (existsSync(agentGif)) {
+          try {
+            const slackApp = getSlackApp();
+            if (slackApp) {
+              const fileContent = await readFile(agentGif);
+              await slackApp.client.files.uploadV2({
+                channel_id: slackSession.channelId,
+                thread_ts: slackSession.threadTs,
+                file: fileContent,
+                filename: `timelapse-${agentId.slice(0, 8)}.gif`,
+                title: `Agent ${agentId.slice(0, 8)} Timelapse`,
+              });
+              console.log(`[server] Session ${sessionId} — GIF uploaded to Slack`);
+            }
+          } catch (err) {
+            console.error(`[server] Failed to upload GIF to Slack:`, err);
+          }
+        }
+      }
+    });
+
+    socket.on("agent:terminated", (data: AgentTerminatedEvent) => {
+      const sessionId = findSessionId(socket);
+      if (!sessionId) return;
+
+      updateAgentStatus(sessionId, data.agentId, "terminated");
+      io.to(`session:${sessionId}`).emit("agent:terminated", {
+        agentId: data.agentId,
+      });
+
+      // If session is being stopped, check if all agents are now terminated
+      if (stoppingSessions.has(sessionId)) {
+        const session = getSession(sessionId);
+        if (session && session.agents.every((a) => a.status === "terminated")) {
+          console.log(`[server] Session ${sessionId} — all agents terminated, completing`);
+          completeStoppedSession(sessionId);
+        }
+      }
+    });
+
+    socket.on("disconnect", () => {
+      console.log(`[socket.io] Client disconnected: ${socket.id}`);
+    });
+  });
+
+  httpServer
+    .once("error", (err) => {
+      console.error(err);
+      process.exit(1);
+    })
+    .listen(port, () => {
+      console.log(`> Ready on http://${hostname}:${port}`);
+    });
+});
+
+/**
+ * Find the session ID from socket rooms.
+ * Workers join rooms named "session:{id}".
+ */
+function findSessionId(socket: { rooms: Set<string> }): string | null {
+  for (const room of socket.rooms) {
+    if (room.startsWith("session:")) {
+      return room.slice("session:".length);
+    }
+  }
+  return null;
+}
+
+function isSessionFullyComplete(sessionId: string): boolean {
+  const session = getSession(sessionId);
+  if (!session) return true;
+  return session.todos.length > 0 && session.todos.every((t) => t.status === "completed");
+}

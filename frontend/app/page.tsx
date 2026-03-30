@@ -1,0 +1,384 @@
+"use client";
+
+import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { useSession, signOut } from "next-auth/react";
+import { useBilling } from "@flowglad/nextjs";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { Loader2, LogOut, Lock } from "lucide-react";
+import { PlanBadge } from "@/components/plan-badge";
+import { PLAN_LIMITS, PRO_FEATURE_SLUG } from "@/lib/billing-constants";
+import { DashboardGrid } from "@/components/dashboard/dashboard-grid";
+import { MobilePromptSheet } from "@/components/mobile-prompt-sheet";
+import { MobileNav } from "@/components/mobile-nav";
+import { useDashboardSocket } from "@/hooks/use-dashboard-socket";
+import { useIsDesktop } from "@/hooks/use-media-query";
+import Link from "next/link";
+
+const EXAMPLE_PROMPTS = [
+  {
+    label: "Browser QA Testing",
+    prompt:
+      "Run automated QA testing of our web app across Chrome, Firefox, and Safari. Check for layout issues, broken links, form validation, and console errors on each browser.",
+  },
+  {
+    label: "Install OpenClaw",
+    prompt:
+      "Install OpenClaw by running: curl -fsSL https://openclaw.ai/install.sh | bash",
+  },
+  {
+    label: "Research Paper",
+    prompt:
+      "Write a comprehensive research paper on Google Docs about the rise of Daedalus Labs",
+  },
+  {
+    label: "Data Dashboard",
+    prompt:
+      "Build an interactive sales dashboard with charts and filters using a spreadsheet app. Include monthly revenue, top products, and regional breakdowns.",
+  },
+  {
+    label: "Long-Term AI Research",
+    prompt:
+      "Conduct extensive research on the latest AI agent frameworks, spend several hours browsing papers, GitHub repos, and documentation. Create a detailed comparison matrix in a spreadsheet.",
+    panopticon: true,
+  },
+  {
+    label: "Market Analysis Deep-Dive",
+    prompt:
+      "Research the competitive landscape for AI development tools. Monitor pricing changes, feature releases, and community sentiment across 10+ companies for multiple hours. Track everything in a comprehensive document.",
+    panopticon: true,
+  },
+];
+
+interface SessionHistoryItem {
+  id: string;
+  prompt: string;
+  status: string;
+  createdAt: Date;
+  todos: { id: string; description: string; status: string }[];
+  latestThumbnail?: string;
+}
+
+export default function Home() {
+  const { data: authSession } = useSession();
+  const { checkFeatureAccess } = useBilling();
+  const [prompt, setPrompt] = useState("");
+  const [agentCount, setAgentCount] = useState(2);
+
+  const isPro = checkFeatureAccess?.(PRO_FEATURE_SLUG) ?? false;
+  const maxAgents = isPro
+    ? PLAN_LIMITS.pro.maxAgents
+    : PLAN_LIMITS.free.maxAgents;
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<SessionHistoryItem[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [mobilePromptOpen, setMobilePromptOpen] = useState(false);
+
+  const router = useRouter();
+  const isDesktop = useIsDesktop();
+  const { thumbnails, sessionUpdates } = useDashboardSocket();
+
+  // Fetch sessions on mount
+  useEffect(() => {
+    async function fetchSessions() {
+      try {
+        const response = await fetch("/api/sessions/history");
+        if (response.ok) {
+          const data = await response.json();
+          setSessions(data.sessions);
+        }
+      } catch {
+        // Silently fail — user may not be authenticated
+      } finally {
+        setSessionsLoading(false);
+      }
+    }
+    fetchSessions();
+  }, []);
+
+  // Merge live session updates from socket
+  useEffect(() => {
+    if (sessionUpdates.size === 0) return;
+    setSessions((prev) =>
+      prev.map((s) => {
+        const update = sessionUpdates.get(s.id);
+        if (!update) return s;
+        return { ...s, status: update.status };
+      })
+    );
+  }, [sessionUpdates]);
+
+  const handleSubmit = async () => {
+    if (!prompt.trim() || isSubmitting) return;
+
+    setIsSubmitting(true);
+    setError(null);
+
+    try {
+      const response = await fetch("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: prompt.trim(),
+          agentCount,
+        }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error || "Failed to create session");
+      }
+
+      const { sessionId } = await response.json();
+      router.push(`/session/${sessionId}/approve`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong");
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
+
+  const handleSelectSession = (sessionId: string, status: string) => {
+    if (status === "completed") {
+      router.push(`/session/${sessionId}/summary`);
+    } else if (status === "pending_approval") {
+      router.push(`/session/${sessionId}/approve`);
+    } else {
+      router.push(`/session/${sessionId}`);
+    }
+  };
+
+  const handleDemoMode = () => {
+    const params = new URLSearchParams({
+      prompt:
+        prompt.trim() ||
+        "Write a comprehensive research paper on Google Docs about the rise of Daedalus Labs...",
+      agents: String(agentCount),
+    });
+    router.push(`/session/demo?${params.toString()}`);
+  };
+
+  return (
+    <div className="relative flex min-h-screen flex-col pb-16 lg:pb-0">
+      {/* Top bar */}
+      <header className="shrink-0 flex items-center justify-between px-4 py-3 lg:px-6 lg:py-4 border-b border-border/50">
+        <h1 className="text-lg font-bold tracking-tight text-foreground">
+          Opticon
+        </h1>
+
+        {authSession?.user && (
+          <div className="flex items-center gap-3">
+            {authSession.user.image ? (
+              <img
+                src={authSession.user.image}
+                alt=""
+                className="size-7 rounded-full"
+              />
+            ) : (
+              <div className="flex size-7 items-center justify-center rounded-full bg-primary/20 text-xs font-medium text-primary">
+                {authSession.user.name?.[0] ||
+                  authSession.user.email?.[0] ||
+                  "?"}
+              </div>
+            )}
+            <span className="hidden sm:inline text-sm text-zinc-400">
+              {authSession.user.name || authSession.user.email}
+            </span>
+            <PlanBadge />
+            <Link href="/panopticon" className="hidden sm:inline-flex">
+              <Button variant="ghost" size="sm" className="text-zinc-500 hover:text-zinc-300 text-xs">
+                Panopticon
+              </Button>
+            </Link>
+            <Link href="/pricing" className="hidden sm:inline-flex">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-zinc-500 hover:text-zinc-300 text-xs"
+              >
+                Pricing
+              </Button>
+            </Link>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => signOut()}
+              className="text-zinc-500 hover:text-zinc-300"
+            >
+              <LogOut className="size-4" />
+            </Button>
+          </div>
+        )}
+      </header>
+
+      {/* Main content area */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Dashboard grid — full width on mobile, left side on desktop */}
+        <div className="flex-1 overflow-y-auto px-4 py-4 lg:px-6 lg:py-6">
+          {sessionsLoading ? (
+            <div className="flex items-center justify-center py-20">
+              <Loader2 className="size-5 animate-spin text-zinc-600" />
+            </div>
+          ) : (
+            <DashboardGrid
+              sessions={sessions}
+              thumbnails={thumbnails}
+              onSelectSession={handleSelectSession}
+              onNewTask={() => setMobilePromptOpen(true)}
+            />
+          )}
+        </div>
+
+        {/* Right panel — prompt input (desktop only) */}
+        {isDesktop && (
+          <div className="w-[400px] shrink-0 border-l border-border/50 bg-card/30 p-6 overflow-y-auto">
+            <div className="space-y-6">
+              <div className="space-y-2">
+                <h2 className="text-sm font-semibold text-zinc-300">
+                  New Task
+                </h2>
+                <p className="text-xs text-zinc-500">
+                  Describe a complex task. AI agents will execute it on
+                  cloud desktops in parallel.
+                </p>
+              </div>
+
+              {/* Input area */}
+              <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 backdrop-blur-sm overflow-hidden transition-colors focus-within:border-zinc-700">
+                <Textarea
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Write a research paper on Google Docs about the rise of Daedalus Labs..."
+                  className="min-h-[128px] resize-none border-0 bg-transparent px-5 pt-4 pb-3 text-sm text-zinc-100 placeholder:text-zinc-600 focus-visible:ring-0 leading-relaxed"
+                  disabled={isSubmitting}
+                />
+
+                <div className="flex items-center justify-between border-t border-zinc-800/50 px-4 py-3">
+                  <div className="flex items-center gap-3">
+                    <span className="text-xs text-zinc-500 font-medium">
+                      Agents
+                    </span>
+                    <div className="flex gap-1">
+                      {[1, 2, 3, 4].map((n) => {
+                        const isLocked = n > maxAgents;
+                        return (
+                          <button
+                            key={n}
+                            type="button"
+                            onClick={() => {
+                              if (isLocked) {
+                                router.push("/pricing");
+                              } else {
+                                setAgentCount(n);
+                              }
+                            }}
+                            disabled={isSubmitting}
+                            title={
+                              isLocked
+                                ? "Upgrade to Pro to unlock"
+                                : undefined
+                            }
+                            className={`flex size-7 items-center justify-center rounded-md text-xs font-medium transition-all ${
+                              isLocked
+                                ? "text-zinc-700 cursor-pointer hover:text-zinc-500"
+                                : agentCount === n
+                                  ? "bg-primary/15 text-primary ring-1 ring-primary/30"
+                                  : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"
+                            }`}
+                          >
+                            {isLocked ? (
+                              <Lock className="size-3" />
+                            ) : (
+                              n
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleDemoMode}
+                      disabled={isSubmitting}
+                      className="text-zinc-400"
+                    >
+                      Demo
+                    </Button>
+                    <Button
+                      onClick={handleSubmit}
+                      disabled={isSubmitting || !prompt.trim()}
+                      size="sm"
+                      className="gap-2"
+                    >
+                      {isSubmitting ? (
+                        <>
+                          <Loader2 className="size-3.5 animate-spin" />
+                          Decomposing...
+                        </>
+                      ) : (
+                        "Launch"
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Example prompts */}
+              <div className="flex flex-wrap gap-2">
+                {EXAMPLE_PROMPTS.map((example) => (
+                  <button
+                    key={example.label}
+                    onClick={() => setPrompt(example.prompt)}
+                    className="rounded-full border border-zinc-800 bg-zinc-900/60 px-3 py-1.5 text-xs text-zinc-500 hover:text-zinc-300 hover:border-zinc-700 hover:bg-zinc-800/60 transition-all"
+                  >
+                    {example.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Keyboard hint */}
+              <p className="text-xs text-zinc-600">
+                <kbd className="rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 font-mono text-[10px] text-zinc-500">
+                  {"\u2318"}
+                </kbd>
+                <span className="mx-1">+</span>
+                <kbd className="rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 font-mono text-[10px] text-zinc-500">
+                  {"\u21B5"}
+                </kbd>
+                <span className="ml-1.5">to launch</span>
+              </p>
+
+              {/* Error */}
+              {error && (
+                <div className="animate-slide-in rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                  {error}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Mobile bottom nav */}
+      <MobileNav onNewTask={() => setMobilePromptOpen(true)} />
+
+      {/* Mobile prompt sheet */}
+      <MobilePromptSheet
+        open={mobilePromptOpen}
+        onOpenChange={setMobilePromptOpen}
+      />
+    </div>
+  );
+}

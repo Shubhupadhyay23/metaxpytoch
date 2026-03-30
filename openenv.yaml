@@ -1,0 +1,4 @@
+name: secure-review-ai
+description: AI code review environment with secure execution
+actions:
+  - review

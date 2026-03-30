@@ -1,0 +1,6 @@
+.env
+.env.local
+__pycache__/
+workers/__pycache__
+.memories/
+node_modules

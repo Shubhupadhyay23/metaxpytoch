@@ -1,10 +1,10 @@
----
-title: Metaxpytorch
-emoji: 🔥
-colorFrom: red
-colorTo: green
-sdk: docker
-pinned: false
----
+SecureReviewAI is an AI-powered code review environment.
 
-Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+Key Features:
+- Detect bugs in pull requests
+- Suggest fixes
+- Execute code in secure sandbox (VM simulation)
+- Predict risk and approve/reject PR
+
+Innovation:
+Unlike traditional systems, this project validates fixes by executing code inside isolated environments.
