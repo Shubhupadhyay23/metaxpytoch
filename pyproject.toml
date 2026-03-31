@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "secure-review-ai"
+version = "0.1.0"
+description = "AI code review environment with secure execution"
+requires-python = ">=3.9"
+dependencies = [
+    "flask",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["env*", "graders*", "tasks*", "vm*", "workers*"]
