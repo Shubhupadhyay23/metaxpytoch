@@ -4,11 +4,11 @@ from env.coding_review_env import CodingReviewEnv
 app = Flask(__name__)
 env = CodingReviewEnv()
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "POST"])
 def index():
     return jsonify({"status": "API is running! Visit /state, /reset, or POST to /step"})
 
-@app.route("/reset", methods=["GET"])
+@app.route("/reset", methods=["GET", "POST"])
 def reset():
     return jsonify(env.reset())
 
@@ -22,7 +22,7 @@ def step():
         "done": done
     })
 
-@app.route("/state", methods=["GET"])
+@app.route("/state", methods=["GET", "POST"])
 def state():
     return jsonify(env.state())
 
