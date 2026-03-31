@@ -1,4 +1,80 @@
 name: secure-review-ai
-description: AI code review environment with secure execution
-actions:
-  - review
+version: "0.1.0"
+description: >
+  AI Code Review Environment that simulates real-world pull request review workflows.
+  Agents act as senior engineers reviewing code for bugs, security issues, and quality.
+
+observation_space:
+  type: object
+  fields:
+    task_id:
+      type: string
+      description: Unique task identifier
+    difficulty:
+      type: string
+      enum: [easy, medium, hard]
+    repo_files:
+      type: object
+      description: Map of filename to source code content
+    bug_hint:
+      type: string
+      description: Category of bug present in the code
+    risk_score:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+    description:
+      type: string
+      description: Natural language description of the PR task
+
+action_space:
+  type: object
+  fields:
+    bug_type:
+      type: string
+      description: Identified bug category (e.g. division_by_zero, sql_injection)
+    fix_code:
+      type: string
+      description: Corrected Python code as a string
+    reasoning:
+      type: string
+      description: Agent explanation of the bug and proposed fix
+    decision:
+      type: string
+      enum: [APPROVE, REQUEST_CHANGES]
+
+reward_range: [0.0, 1.0]
+reward_breakdown:
+  bug_detection: 0.30
+  fix_quality:   0.40
+  reasoning:     0.20
+  decision:      0.10
+
+max_steps: 5
+
+tasks:
+  - id: task1
+    difficulty: easy
+    bug: division_by_zero
+  - id: task2
+    difficulty: easy
+    bug: key_error
+  - id: task3
+    difficulty: medium
+    bug: sql_injection
+  - id: task4
+    difficulty: medium
+    bug: race_condition
+  - id: task5
+    difficulty: hard
+    bug: memory_leak
+
+endpoints:
+  root:   GET|POST /
+  reset:  GET|POST /reset
+  step:   POST /step
+  state:  GET|POST /state
+  tasks:  GET /tasks
+
+inference_script: inference.py
+requires_python: ">=3.10"

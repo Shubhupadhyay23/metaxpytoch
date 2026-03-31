@@ -8,8 +8,9 @@ version = "0.1.0"
 description = "AI code review environment with secure execution"
 requires-python = ">=3.10"
 dependencies = [
-    "flask",
+    "flask>=2.3.0",
     "openenv-core>=0.2.0",
+    "openai>=1.0.0",
 ]
 
 [project.scripts]
