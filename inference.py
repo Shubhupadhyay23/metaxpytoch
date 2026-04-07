@@ -250,7 +250,7 @@ def run_baseline():
         
         # Format for [END]
         success_str = "true" if reward > 0.0 else "false"
-        print(f"[END] success={success_str} steps=1 score={reward:.2f} rewards={reward:.2f}", flush=True)
+        print(f"[END] task={task_id} success={success_str} steps=1 score={reward:.2f} rewards={reward:.2f}", flush=True)
         print(file=sys.stderr)
 
     elapsed = time.time() - t_start
