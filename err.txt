@@ -1,0 +1,42 @@
+============================================================
+  SecureReviewAI — Baseline Inference Script
+============================================================
+  Mode  : Heuristic fallback (set API_BASE_URL + HF_TOKEN for LLM)
+
+  Task task1 [easy]
+    Bug hint : division_by_zero
+    Action   : bug_type='division_by_zero', decision='REQUEST_CHANGES'
+    Reward   : 0.9900
+
+  Task task2 [easy]
+    Bug hint : key_error
+    Action   : bug_type='key_error', decision='REQUEST_CHANGES'
+    Reward   : 0.9900
+
+  Task task3 [medium]
+    Bug hint : sql_injection
+    Action   : bug_type='sql_injection', decision='REQUEST_CHANGES'
+    Reward   : 0.9900
+
+  Task task4 [medium]
+    Bug hint : race_condition
+    Action   : bug_type='race_condition', decision='REQUEST_CHANGES'
+    Reward   : 0.9900
+
+  Task task5 [hard]
+    Bug hint : memory_leak
+    Action   : bug_type='memory_leak', decision='REQUEST_CHANGES'
+    Reward   : 0.9900
+
+------------------------------------------------------------
+  RESULTS
+------------------------------------------------------------
+  task1 score : 0.9900
+  task2 score : 0.9900
+  task3 score : 0.9900
+  task4 score : 0.9900
+  task5 score : 0.9900
+  Mean score : 0.9900
+  Total      : 4.9500 / 5.0
+  Runtime    : 0.0s
+============================================================

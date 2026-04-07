@@ -203,20 +203,20 @@ def llm_agent(obs: dict, client: "OpenAI") -> dict:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run_baseline():
-    print("=" * 60)
-    print("  SecureReviewAI — Baseline Inference Script")
-    print("=" * 60)
+    print("=" * 60, file=sys.stderr)
+    print("  SecureReviewAI — Baseline Inference Script", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
 
     if USE_LLM:
-        print(f"  Mode  : LLM  ({MODEL_NAME} @ {API_BASE_URL})")
+        print(f"  Mode  : LLM  ({MODEL_NAME} @ {API_BASE_URL})", file=sys.stderr)
         client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
         agent_fn = lambda obs: llm_agent(obs, client)
     else:
-        print("  Mode  : Heuristic fallback (set API_BASE_URL + HF_TOKEN for LLM)")
+        print("  Mode  : Heuristic fallback (set API_BASE_URL + HF_TOKEN for LLM)", file=sys.stderr)
         client = None
         agent_fn = heuristic_agent
 
-    print()
+    print(file=sys.stderr)
 
     env = CodingReviewEnv()
     obs = env.reset()
@@ -227,35 +227,44 @@ def run_baseline():
     while not done:
         task_id    = obs.get("task_id", "?")
         difficulty = obs.get("difficulty", "?")
-        print(f"[START] task={task_id}", flush=True)
-        print(f"  Task {task_id} [{difficulty}]")
-        print(f"    Bug hint : {obs.get('bug_hint')}")
+        print(f"[START] task={task_id} env=SecureReviewAI model={MODEL_NAME}", flush=True)
+        print(f"  Task {task_id} [{difficulty}]", file=sys.stderr)
+        print(f"    Bug hint : {obs.get('bug_hint')}", file=sys.stderr)
 
         action = agent_fn(obs)
-        print(f"    Action   : bug_type={action.get('bug_type')!r}, decision={action.get('decision')!r}")
+        print(f"    Action   : bug_type={action.get('bug_type')!r}, decision={action.get('decision')!r}", file=sys.stderr)
 
         obs, reward, done, info = env.step(action)
-        print(f"[STEP] step=1 reward={reward}", flush=True)
+        
+        # Format for [STEP]
+        action_str = json.dumps(action).replace(" ", "")
+        done_str = str(done).lower()
+        err_msg = info.get("error")
+        err_str = "null" if not err_msg else f"'{err_msg}'"
+        print(f"[STEP] step=1 action={action_str} reward={reward:.2f} done={done_str} error={err_str}", flush=True)
         scores.append(reward)
-        print(f"    Reward   : {reward:.4f}")
+        print(f"    Reward   : {reward:.4f}", file=sys.stderr)
 
         if info.get("error"):
             print(f"    Error    : {info['error']}", file=sys.stderr)
-        print(f"[END] task={task_id} score={reward} steps=1", flush=True)
-        print()
+        
+        # Format for [END]
+        success_str = "true" if reward > 0.0 else "false"
+        print(f"[END] success={success_str} steps=1 score={reward:.2f} rewards={reward:.2f}", flush=True)
+        print(file=sys.stderr)
 
     elapsed = time.time() - t_start
 
     # ── Final summary ────────────────────────────────────────────────────
-    print("-" * 60)
-    print("  RESULTS")
-    print("-" * 60)
+    print("-" * 60, file=sys.stderr)
+    print("  RESULTS", file=sys.stderr)
+    print("-" * 60, file=sys.stderr)
     for i, s in enumerate(scores):
-        print(f"  task{i+1} score : {s:.4f}")
-    print(f"  Mean score : {sum(scores)/len(scores):.4f}")
-    print(f"  Total      : {sum(scores):.4f} / {len(scores):.1f}")
-    print(f"  Runtime    : {elapsed:.1f}s")
-    print("=" * 60)
+        print(f"  task{i+1} score : {s:.4f}", file=sys.stderr)
+    print(f"  Mean score : {sum(scores)/len(scores):.4f}", file=sys.stderr)
+    print(f"  Total      : {sum(scores):.4f} / {len(scores):.1f}", file=sys.stderr)
+    print(f"  Runtime    : {elapsed:.1f}s", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
 
     # Validate scores in range
     for s in scores:
