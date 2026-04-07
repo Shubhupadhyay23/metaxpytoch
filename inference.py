@@ -227,6 +227,7 @@ def run_baseline():
     while not done:
         task_id    = obs.get("task_id", "?")
         difficulty = obs.get("difficulty", "?")
+        print(f"[START] task={task_id}", flush=True)
         print(f"  Task {task_id} [{difficulty}]")
         print(f"    Bug hint : {obs.get('bug_hint')}")
 
@@ -234,11 +235,13 @@ def run_baseline():
         print(f"    Action   : bug_type={action.get('bug_type')!r}, decision={action.get('decision')!r}")
 
         obs, reward, done, info = env.step(action)
+        print(f"[STEP] step=1 reward={reward}", flush=True)
         scores.append(reward)
         print(f"    Reward   : {reward:.4f}")
 
         if info.get("error"):
             print(f"    Error    : {info['error']}", file=sys.stderr)
+        print(f"[END] task={task_id} score={reward} steps=1", flush=True)
         print()
 
     elapsed = time.time() - t_start
