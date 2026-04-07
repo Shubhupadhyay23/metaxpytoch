@@ -71,4 +71,5 @@ def grade(action: dict, task: dict) -> float:
 
     # Clamp to [0.0, 1.0] and apply difficulty weight (currently all 1.0)
     score = min(1.0, score) * DIFFICULTY_WEIGHT.get(difficulty, 1.0)
+    score = max(0.001, min(0.999, score))
     return round(score, 4)

@@ -259,7 +259,7 @@ def run_baseline():
 
     # Validate scores in range
     for s in scores:
-        assert 0.0 <= s <= 1.0, f"Score out of range: {s}"
+        assert 0.0 < s < 1.0, f"Score out of range: {s}"
 
     return scores
 

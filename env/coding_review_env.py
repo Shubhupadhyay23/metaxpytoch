@@ -93,7 +93,7 @@ class CodingReviewEnv:
         if not valid:
             self.errors.append(err)
             info = {"error": err, "valid": False}
-            return _task_to_observation(self.tasks[self.index]), 0.0, False, info
+            return _task_to_observation(self.tasks[self.index]), 0.001, False, info
 
         task = self.tasks[self.index]
         reward = grade(action, task)
