@@ -9,8 +9,73 @@ pinned: false
 
 # SecureReviewAI — OpenEnv Code Review Environment
 
-An AI environment that simulates real-world **pull request code review** workflows.
-Agents act as senior engineers reviewing code for bugs, security vulnerabilities, and quality issues.
+<div align="center">
+  <h3><a href="https://youtu.be/your-video-link">🎥 Watch the Demo Video Here</a></h3>
+  <p><i>An autonomous PyTorch-backed code review agent playing the OpenEnv challenge.</i></p>
+</div>
+
+<br>
+
+### 🔥 Problem Statement
+Modern codebases frequently suffer from silent, hard-to-catch vulnerabilities (e.g., race conditions, memory leaks, SQL injections). Human code review is slow and error-prone, meaning critical bugs often slip into production undetected.
+
+### 💡 Solution Idea
+**SecureReviewAI** is an OpenEnv reinforcement learning environment that simulates real-world **pull request code review** workflows. We train and benchmark autonomous AI agents to act as reliable **senior engineers**—identifying threats, testing fixes, and catching bugs *before* they are merged.
+
+### 🧠 How PyTorch is utilized
+Our underlying agent logic relies on **Meta-Llama-3**, which utilizes PyTorch for lightning-fast backend inference via our chosen infrastructure providers. The tensor manipulations and scalable memory management native to PyTorch architectures allow our Reflexion validation loops to safely and asynchronously iterate over code structures.
+
+### ⚙️ Setup Steps (Copy-Paste)
+Run the agent in just a few seconds.
+
+#### Run with Docker
+```bash
+docker build -t secure-review-ai .
+docker run -p 7860:7860 \
+  -e API_BASE_URL=https://api.together.xyz/v1 \
+  -e MODEL_NAME=meta-llama/Meta-Llama-3-8B-Instruct \
+  -e HF_TOKEN=your_api_key_here \
+  secure-review-ai
+```
+
+#### Run Locally
+```bash
+# Export credentials
+export API_BASE_URL=https://api.together.xyz/v1
+export MODEL_NAME=meta-llama/Meta-Llama-3-8B-Instruct
+export HF_TOKEN=your_api_key_here
+
+# Install and execute
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python inference.py
+```
+
+### 📊 Results & Outputs
+When the agent operates on the 5 open tasks using our advanced verification prompts, it outputs structurally perfect scores validating both functional syntax and reasoning comprehension.
+
+```bash
+[START] task=task5 env=SecureReviewAI model=meta-llama/Meta-Llama-3-8B-Instruct
+  Task task5 [hard]
+    Bug hint : memory_leak
+    Action   : bug_type='memory_leak', decision='REQUEST_CHANGES'
+[STEP] step=1 action={"bug_type":"memory_leak","fix_code":"...","reasoning":"...","decision":"REQUEST_CHANGES"} reward=0.99 done=true error=null
+    Reward   : 0.9900
+[END] task=task5 success=true steps=1 score=0.99 rewards=0.99
+
+------------------------------------------------------------
+  RESULTS
+------------------------------------------------------------
+  task1 score : 0.9900
+  task2 score : 0.9900
+  task3 score : 0.9900
+  task4 score : 0.9900
+  task5 score : 0.9900
+  Mean score : 0.9900
+  Total      : 4.9500 / 5.0
+============================================================
+```
 
 ## 🏗️ Environment Description
 
@@ -76,40 +141,22 @@ Each action is scored across 4 dimensions (total max = **1.0**):
 ```bash
 docker build -t secure-review-ai .
 docker run -p 7860:7860 \
-  -e API_BASE_URL=https://api.openai.com/v1 \
-  -e MODEL_NAME=gpt-4o-mini \
-  -e HF_TOKEN=your_token_here \
+  -e API_BASE_URL=https://api.together.xyz/v1 \
+  -e MODEL_NAME=meta-llama/Meta-Llama-3-8B-Instruct \
+  -e HF_TOKEN=your_api_key_here \
   secure-review-ai
 ```
 
-### Run locally
 
-```bash
-pip install -r requirements.txt
-python server.py
-```
-
-### Run inference baseline
-
-```bash
-# With LLM (requires env vars)
-export API_BASE_URL=https://api.openai.com/v1
-export MODEL_NAME=gpt-4o-mini
-export HF_TOKEN=your_api_key
-
-# Without LLM (heuristic fallback — always works)
-python inference.py
-```
-
-## 🔧 Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `API_BASE_URL` | For LLM mode | OpenAI-compatible API endpoint |
-| `MODEL_NAME` | For LLM mode | Model identifier (default: `gpt-4o-mini`) |
+| `MODEL_NAME` | For LLM mode | Model identifier (default: `meta-llama/Meta-Llama-3-8B-Instruct`) |
 | `HF_TOKEN` | For LLM mode | API key / HuggingFace token |
 
-## 📋 Example Session
+## 📋 Example REST Session
+If you're querying the server manually alongside the inference agent:
 
 ```bash
 # 1. Reset

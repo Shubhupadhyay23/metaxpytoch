@@ -1,5 +1,9 @@
 .env
 .env.local
+env.txt
+*.log
+out.txt
+err.txt
 __pycache__/
 workers/__pycache__
 .memories/

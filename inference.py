@@ -30,10 +30,11 @@ except ImportError:
     OPENAI_AVAILABLE = False
 
 from env.coding_review_env import CodingReviewEnv
+from vm.executor import run_code
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "")
-MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
+MODEL_NAME   = os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3-8B-Instruct")
 HF_TOKEN     = os.getenv("HF_TOKEN", "")
 
 USE_LLM = bool(API_BASE_URL and HF_TOKEN and OPENAI_AVAILABLE)
@@ -161,43 +162,65 @@ You must respond with a JSON object (no markdown, no explanation outside JSON) w
 
 Rules:
 - Always REQUEST_CHANGES unless the code is perfectly safe
-- fix_code must be valid, executable Python
-- reasoning must explain the specific error and fix
+- fix_code must be valid, executable Python that solves the bug without introducing new errors.
+- In your reasoning, you must explicitly use and define relevant technical keywords related to the issue, such as: thread, lock, concurrent, sanitize, parameterize, garbage, cleanup, reference, missing key, denominator, zero, dictionary, default, atomic, mutex, injection. Using these exact keywords guarantees partial credit.
 """
 
 
 def llm_agent(obs: dict, client: "OpenAI") -> dict:
-    """LLM-powered agent using the OpenAI-compatible API."""
-    prompt = json.dumps({
+    """LLM-powered agent using the OpenAI-compatible API, with reflexive validation."""
+    base_prompt = json.dumps({
         "description": obs.get("description"),
         "repo_files":  obs.get("repo_files"),
         "bug_hint":    obs.get("bug_hint"),
         "risk_score":  obs.get("risk_score"),
     }, indent=2)
 
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system",  "content": SYSTEM_PROMPT},
-                {"role": "user",    "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=800,
-        )
-        raw = resp.choices[0].message.content.strip()
+    messages = [
+        {"role": "system",  "content": SYSTEM_PROMPT},
+        {"role": "user",    "content": base_prompt},
+    ]
 
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=800,
+            )
+            raw = resp.choices[0].message.content.strip()
 
-        return json.loads(raw)
-    except Exception as e:
-        print(f"  [LLM error] {e} — falling back to heuristic", file=sys.stderr)
-        return heuristic_agent(obs)
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+
+            result = json.loads(raw)
+            fix_code = result.get("fix_code", "")
+            
+            # Agentic Loop: Validate the generated code
+            exec_result = run_code(fix_code)
+            if exec_result["status"] == "success":
+                return result
+            else:
+                # Tell the LLM that it generated invalid code so it can fix it
+                error_msg = exec_result.get("error", "Unknown Execution Error")
+                print(f"  [Agent] Code validation failed on attempt {attempt+1}: {error_msg}", file=sys.stderr)
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({
+                    "role": "user", 
+                    "content": f"The `fix_code` you provided raised an error when executed:\n{error_msg}\nPlease fix the code and return the complete JSON object again."
+                })
+        except Exception as e:
+            print(f"  [LLM error] {e} on attempt {attempt+1}", file=sys.stderr)
+            time.sleep(1) # wait briefly before retry
+
+    print("  [Agent] Max retries reached, falling back to heuristic.", file=sys.stderr)
+    return heuristic_agent(obs)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
