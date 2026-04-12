@@ -4,3 +4,5 @@ pydantic
 pytest
 fastapi
 pyyaml
+flask
+openenv-core
