@@ -10,14 +10,15 @@ Score breakdown (total max = 1.0):
 """
 
 from vm.executor import run_code
+from env.models import Action, TaskDef
 
 # Keywords associated with each bug type for partial reasoning credit
 BUG_KEYWORDS = {
-    "division_by_zero": ["zero", "division", "divide", "denominator", "nan", "infinity"],
-    "key_error":        ["key", "missing", "optional", "default", "get(", "dict"],
-    "sql_injection":    ["injection", "sanitize", "parameterize", "escape", "query", "input"],
-    "race_condition":   ["race", "thread", "lock", "mutex", "atomic", "concurrent", "sync"],
-    "memory_leak":      ["leak", "memory", "reference", "garbage", "registry", "cleanup", "weakref"],
+    "path_traversal": ["os.path", "traversal", "directory", "../", "sanitize", "abspath", "commonpath"],
+    "unsafe_yaml":    ["yaml", "safe_load", "rce", "execution", "untrusted", "Loader", "constructor"],
+    "sql_injection":  ["injection", "sanitize", "parameterize", "escape", "query", "input", "?"],
+    "race_condition": ["race", "asyncio", "lock", "mutex", "atomic", "concurrent", "gather", "await"],
+    "memory_leak":    ["leak", "memory", "reference", "garbage", "registry", "cleanup", "weakref", "del"],
 }
 
 # Difficulty multiplier — harder tasks grant proportionally more reward
@@ -28,35 +29,36 @@ DIFFICULTY_WEIGHT = {
 }
 
 
-def grade(action: dict, task: dict) -> float:
+def grade(action: Action, task: TaskDef) -> float:
     """
     Grade an agent action against a task definition.
 
-    Returns a float in [0.0, 1.0].
+    Returns a float in [0.0, 1.0] (exclusive to [0.001, 0.999]).
     """
     score = 0.0
-    bug = task.get("bug", "")
-    difficulty = task.get("difficulty", "easy")
+    bug = task.bug
+    difficulty = task.difficulty
 
     # ── 1. Bug detection (0.0 – 0.30) ────────────────────────────────────
-    detected = action.get("bug_type", "").strip().lower()
+    detected = action.bug_type.strip().lower()
     if detected == bug:
         score += 0.30                          # exact match
     elif detected in bug or bug in detected:
         score += 0.15                          # partial match (substring)
 
     # ── 2. Fix quality (0.0 – 0.40) ──────────────────────────────────────
-    fix_code = action.get("fix_code", "")
+    fix_code = action.fix_code
     if fix_code:
-        result = run_code(fix_code)
+        # Run fix_code combined with test_code to verify logic
+        result = run_code(fix_code, test_code=task.test_code)
         if result["status"] == "success":
             score += 0.40
         else:
-            # Partial credit: code was provided but has a runtime error
+            # Partial credit: code was provided but verification failed
             score += 0.10
 
     # ── 3. Reasoning quality (0.0 – 0.20) ────────────────────────────────
-    reasoning = action.get("reasoning", "").lower()
+    reasoning = action.reasoning.lower()
     keywords = BUG_KEYWORDS.get(bug, [])
     matched = sum(1 for kw in keywords if kw in reasoning)
     if matched >= 2:
@@ -65,11 +67,11 @@ def grade(action: dict, task: dict) -> float:
         score += 0.10
 
     # ── 4. Decision correctness (0.0 – 0.10) ─────────────────────────────
-    expected = task.get("expected_decision", "REQUEST_CHANGES")
-    if action.get("decision") == expected:
+    expected = task.expected_decision
+    if action.decision == expected:
         score += 0.10
 
-    # Clamp to [0.0, 1.0] and apply difficulty weight (currently all 1.0)
+    # Clamp to strictly between (0.0, 1.0) exclusive
     score = min(1.0, score) * DIFFICULTY_WEIGHT.get(difficulty, 1.0)
-    score = max(0.01, min(0.99, score))
+    score = max(0.001, min(0.999, score))
     return round(score, 4)

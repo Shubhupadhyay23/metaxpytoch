@@ -1,3 +1,6 @@
-flask
 openai
 python-dotenv
+pydantic
+pytest
+fastapi
+pyyaml

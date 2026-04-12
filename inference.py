@@ -21,6 +21,10 @@ import json
 import os
 import sys
 import time
+from dotenv import load_dotenv
+
+# Load any local env.txt file variables automatically
+load_dotenv("env.txt")
 
 # ── Try to import the OpenAI client (required for LLM mode) ─────────────────
 try:
@@ -42,33 +46,37 @@ USE_LLM = bool(API_BASE_URL and HF_TOKEN and OPENAI_AVAILABLE)
 # ── Heuristic keyword agent (fallback, no LLM required) ─────────────────────
 
 HEURISTIC_MAP = {
-    "division_by_zero": {
-        "bug_type": "division_by_zero",
+    "path_traversal": {
+        "bug_type": "path_traversal",
         "fix_code": (
-            "def divide(a, b):\n"
-            "    if b == 0:\n"
-            "        raise ValueError('Denominator cannot be zero')\n"
-            "    return a / b\n"
+            "from fastapi import FastAPI, HTTPException\n"
+            "import os\n\n"
+            "app = FastAPI()\n\n"
+            "@app.get('/download/{filename}')\n"
+            "def download_file(filename: str):\n"
+            "    base_dir = os.path.abspath('/var/www/uploads')\n"
+            "    file_path = os.path.abspath(os.path.join(base_dir, filename))\n"
+            "    if os.path.commonpath([base_dir, file_path]) != base_dir:\n"
+            "        raise HTTPException(status_code=403, detail='Access Denied')\n"
+            "    if not os.path.exists(file_path):\n"
+            "        raise HTTPException(status_code=404, detail='File not found')\n"
+            "    with open(file_path, 'r') as f:\n"
+            "        return f.read()\n"
         ),
         "reasoning": (
-            "The function performs division without checking if the denominator is zero, "
-            "which will raise a ZeroDivisionError exception at runtime."
+            "The endpoint is vulnerable to path traversal because the filename is not sanitized before being concatenated to the base directory. Using os.path.abspath and os.path.commonpath prevents leaving the intended directory."
         ),
         "decision": "REQUEST_CHANGES",
     },
-    "key_error": {
-        "bug_type": "key_error",
+    "unsafe_yaml": {
+        "bug_type": "unsafe_yaml",
         "fix_code": (
-            "def get_display_name(user: dict) -> str:\n"
-            "    first = user.get('first_name', '')\n"
-            "    last  = user.get('last_name', '')\n"
-            "    return f'{first} {last}'.strip()\n\n"
-            "def get_email(user: dict) -> str:\n"
-            "    return user.get('email', '')\n"
+            "import yaml\n\n"
+            "def load_config(yaml_string: str) -> dict:\n"
+            "    return yaml.safe_load(yaml_string)\n"
         ),
         "reasoning": (
-            "The code uses direct dict key access which raises a KeyError if the key "
-            "is missing. Using .get() with a default value handles optional keys safely."
+            "Using yaml.load without a safe Loader enables remote code execution if the input is untrusted. yaml.safe_load safely parses only basic YAML tags, preventing the malicious constructor execution."
         ),
         "decision": "REQUEST_CHANGES",
     },
@@ -90,18 +98,21 @@ HEURISTIC_MAP = {
     "race_condition": {
         "bug_type": "race_condition",
         "fix_code": (
-            "import threading\n\n"
-            "counter = 0\n"
-            "_lock = threading.Lock()\n\n"
-            "def increment():\n"
-            "    global counter\n"
-            "    with _lock:\n"
-            "        counter += 1\n"
+            "import asyncio\n\n"
+            "inventory = {'item_1': 100}\n"
+            "_lock = asyncio.Lock()\n\n"
+            "async def purchase_item(user_id: str):\n"
+            "    async with _lock:\n"
+            "        stock = inventory['item_1']\n"
+            "        if stock > 0:\n"
+            "            await asyncio.sleep(0.1)\n"
+            "            inventory['item_1'] = stock - 1\n"
+            "            return True\n"
+            "        return False\n"
         ),
         "reasoning": (
-            "Multiple threads read and write the shared counter without a lock, "
-            "causing a race condition where increments are lost. "
-            "A threading.Lock ensures atomic updates and concurrent safety."
+            "Multiple coroutines read and write the exact same variable over an await boundary, "
+            "causing a race condition. An asyncio.Lock ensures atomic block execution to prevent over-selling."
         ),
         "decision": "REQUEST_CHANGES",
     },
@@ -109,22 +120,23 @@ HEURISTIC_MAP = {
         "bug_type": "memory_leak",
         "fix_code": (
             "import weakref\n\n"
-            "class Cache:\n"
-            "    _registry = []\n\n"
-            "    def __init__(self, name: str):\n"
-            "        self.name = name\n"
-            "        self.data = {}\n"
-            "        Cache._registry.append(weakref.ref(self))\n\n"
-            "    def store(self, key: str, value: object):\n"
-            "        self.data[key] = value\n\n"
-            "    def clear(self):\n"
-            "        self.data = {}\n"
-            "        Cache._registry[:] = [r for r in Cache._registry if r() is not None]\n"
+            "class ConnectionManager:\n"
+            "    connections = []\n\n"
+            "    def __init__(self, client_id):\n"
+            "        self.client_id = client_id\n"
+            "        self._ref = weakref.ref(self, self._cleanup)\n"
+            "        ConnectionManager.connections.append(self._ref)\n\n"
+            "    @classmethod\n"
+            "    def _cleanup(cls, reference):\n"
+            "        if reference in cls.connections:\n"
+            "            cls.connections.remove(reference)\n\n"
+            "    def disconnect(self):\n"
+            "        print(f'Client {self.client_id} disconnected')\n"
         ),
         "reasoning": (
-            "The class registry holds strong references to Cache instances, "
-            "preventing garbage collection even after clear() is called, causing a memory leak. "
-            "Using weakref.ref allows the garbage collector to reclaim cache instances."
+            "The class registry holds strong references to instances, "
+            "preventing garbage collection even after del is called, causing a memory leak. "
+            "Using weakref.ref allows the garbage collector to reclaim instances and automatically executes a cleanup callback."
         ),
         "decision": "REQUEST_CHANGES",
     },

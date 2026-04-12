@@ -9,62 +9,34 @@ Implements the full OpenEnv interface:
 
 from __future__ import annotations
 from typing import Any, Dict, Literal, List, Tuple
+from pydantic import ValidationError
 
 from tasks.task_registry import load_tasks
 from graders.grader import grade
+from env.models import TaskDef, Observation, Action, StepInfo
 
 
-# ── Typed model helpers (no external deps, pure dicts with validation) ──────
-
-VALID_DECISIONS = {"APPROVE", "REQUEST_CHANGES"}
-REQUIRED_ACTION_FIELDS = {"bug_type", "fix_code", "reasoning", "decision"}
-
-
-def _validate_action(action: dict) -> Tuple[bool, str]:
-    """Return (is_valid, error_message)."""
-    if not isinstance(action, dict):
-        return False, "Action must be a JSON object"
-    missing = REQUIRED_ACTION_FIELDS - action.keys()
-    if missing:
-        return False, f"Missing fields: {sorted(missing)}"
-    if action.get("decision") not in VALID_DECISIONS:
-        return False, f"decision must be one of {VALID_DECISIONS}"
-    return True, ""
-
-
-def _task_to_observation(task: dict) -> dict:
+def _task_to_observation(task: TaskDef) -> dict:
     """Convert internal task dict → public Observation schema."""
-    return {
-        "task_id":    task["id"],
-        "difficulty": task["difficulty"],
-        "repo_files": task["repo_files"],
-        "bug_hint":   task["bug"],          # exposed so agents have context
-        "risk_score": task["risk"],
-        "description": task["description"],
-    }
+    obs = Observation(
+        task_id=task.id,
+        difficulty=task.difficulty,
+        repo_files=task.repo_files,
+        bug_hint=task.bug,
+        risk_score=task.risk,
+        description=task.description,
+    )
+    return obs.model_dump()
 
 
 class CodingReviewEnv:
     """
-    Observation space:
-        task_id    : str          — unique task identifier
-        difficulty : str          — easy | medium | hard
-        repo_files : dict[str,str]— filename → source code
-        bug_hint   : str          — the category of bug present
-        risk_score : float        — 0.0–1.0 risk level
-        description: str          — natural language task description
-
-    Action space:
-        bug_type   : str          — identified bug category
-        fix_code   : str          — corrected Python code
-        reasoning  : str          — agent's explanation
-        decision   : str          — APPROVE | REQUEST_CHANGES
-
+    Observation space and Action space are validated via Pydantic.
     Reward: float in [0.0, 1.0] with partial credits per dimension.
     """
 
     def __init__(self):
-        self.tasks: List[dict] = load_tasks()
+        self.tasks: List[TaskDef] = load_tasks()
         self.index: int = 0
         self.scores: List[float] = []
         self.errors: List[str] = []
@@ -76,9 +48,11 @@ class CodingReviewEnv:
         self.index = 0
         self.scores = []
         self.errors = []
+        if not self.tasks:
+            return {}
         return _task_to_observation(self.tasks[0])
 
-    def step(self, action: dict) -> Tuple[dict, float, bool, dict]:
+    def step(self, action_dict: dict) -> Tuple[dict, float, bool, dict]:
         """
         Apply action to the current task.
 
@@ -89,11 +63,13 @@ class CodingReviewEnv:
             info        : dict with per-dimension scores and validation errors
         """
         # Validate action
-        valid, err = _validate_action(action)
-        if not valid:
+        try:
+            action = Action(**action_dict)
+        except ValidationError as e:
+            err = str(e)
             self.errors.append(err)
-            info = {"error": err, "valid": False}
-            return _task_to_observation(self.tasks[self.index]), 0.01, False, info
+            info = StepInfo(valid=False, error=err).model_dump()
+            return _task_to_observation(self.tasks[self.index]), 0.001, False, info
 
         task = self.tasks[self.index]
         reward = grade(action, task)
@@ -103,13 +79,14 @@ class CodingReviewEnv:
         done = self.index >= len(self.tasks)
         next_obs = {} if done else _task_to_observation(self.tasks[self.index])
 
-        info = {
-            "valid": True,
-            "task_id": task["id"],
-            "task_reward": reward,
-            "cumulative_score": round(sum(self.scores), 4),
-            "tasks_remaining": len(self.tasks) - self.index,
-        }
+        info = StepInfo(
+            valid=True,
+            task_id=task.id,
+            task_reward=reward,
+            cumulative_score=round(sum(self.scores), 4),
+            tasks_remaining=len(self.tasks) - self.index,
+        ).model_dump()
+        
         return next_obs, reward, done, info
 
     def state(self) -> dict:
