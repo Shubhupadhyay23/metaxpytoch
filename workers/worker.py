@@ -16,34 +16,21 @@ sys.path.insert(0, os.path.dirname(__file__))
 import e2b_tools
 from memory import MemoryManager
 from replay import ReplayBuffer
+from agents import AGENT_PROFILES
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = (
-    "You are an AI agent controlling a Linux desktop. "
-    "You will be shown a screenshot of the current screen before each turn. "
-    "Look at the screenshot carefully, then use one of the available tools "
-    "(click, double_click, type_text, press_key, move_mouse, scroll) to interact with the desktop. "
-    "You can only use ONE tool per turn. After your action, you'll receive a new screenshot.\n\n"
-    "IMPORTANT RULES:\n"
-    "- If you see a blank desktop, start by opening a web browser (double-click the browser icon, "
-    "or right-click the desktop and open a terminal, then run 'firefox' or 'chromium').\n"
-    "- You MUST take real actions to accomplish the task. Do NOT call 'done' until you have "
-    "actually performed meaningful actions and can see evidence of completion on screen.\n"
-    "- Break complex tasks into steps: open the right application, navigate to the right place, "
-    "perform the action, and verify the result.\n"
-    "- When the task is genuinely complete and you can confirm it from the screenshot, "
-    "call the 'done' tool with a detailed summary of what you accomplished."
-)
-
-MODEL = "anthropic/claude-sonnet-4-5-20250929"
+# MODEL = "openai/gpt-4o-mini"
+MODEL = "claude-3-5-sonnet-20241022"  # Correct model name for Anthropic
+ENABLE_MOCK_LLM = os.environ.get("ENABLE_MOCK_LLM", "false").lower() == "true"
 MAX_STEPS = 500
-MAX_RETRIES = 3
-RETRY_BASE_DELAY = 2  # seconds
+MAX_RETRIES = 2
+RETRY_BASE_DELAY = 1  # seconds
 HISTORY_KEEP_RECENT = 10  # number of recent screenshot/action exchanges to keep verbatim
 THUMBNAIL_INTERVAL_SECONDS = 10
 MIN_STEPS_BEFORE_DONE = 3  # agent must take at least this many actions before calling done
 CHECKPOINT_INTERVAL = 100  # Pause every N steps for user check-in (Slack only)
+EVENT_THROTTLE_MS = 1000  # Min time between UI updates of the same type
 
 
 def make_screenshot_message():
@@ -52,8 +39,9 @@ def make_screenshot_message():
 
     # Compress PNG to JPEG for smaller API payloads (~500KB-1MB vs 2-8MB)
     img = Image.open(BytesIO(raw_bytes))
+    # Reduce quality for smoother UI streaming (60 is the sweet spot for speed vs clarity)
     jpeg_buf = BytesIO()
-    img.save(jpeg_buf, format="JPEG", quality=75)
+    img.save(jpeg_buf, format="JPEG", quality=40)
     jpeg_b64 = base64.b64encode(jpeg_buf.getvalue()).decode("utf-8")
 
     msg = {
@@ -75,17 +63,44 @@ def make_screenshot_message():
 
 async def call_with_retry(client, **kwargs):
     """Call client.chat.completions.create() with exponential backoff on failure."""
+    
+    if ENABLE_MOCK_LLM:
+        print("⚡ [MOCK] Bypassing real LLM call...", flush=True)
+        await asyncio.sleep(1)
+        # Construct a fake response object matching Dedalus/OpenAI schema
+        from types import SimpleNamespace
+        return SimpleNamespace(choices=[
+            SimpleNamespace(message=SimpleNamespace(
+                content="I will complete the task.",
+                tool_calls=[SimpleNamespace(id="mock_1", function=SimpleNamespace(name="done", arguments="{}"))]
+            ))
+        ])
+
     for attempt in range(MAX_RETRIES):
         try:
-            return await client.chat.completions.create(**kwargs)
+            # Prevent hangs from legacy/future model experiments
+            current_model = kwargs.get('model', '')
+            if "2025" in current_model:
+                raise ValueError(f"❌ Invalid / Future Model detected: {current_model}")
+
+            print(f"🧠 FULL KWARGS: {kwargs}", flush=True)
+            print(f"  (attempt {attempt + 1}/{MAX_RETRIES}) Calling LLM: {current_model}...", flush=True)
+            
+            # Hard 30s timeout for isolation
+            response = await asyncio.wait_for(client.chat.completions.create(**kwargs), timeout=30.0)
+            
+            print("✅ LLM response received", flush=True)
+            return response
+        except asyncio.TimeoutError:
+            print(f"❌ LLM TIMEOUT after 20s (Attempt {attempt + 1})", flush=True)
+            if attempt == MAX_RETRIES - 1:
+                raise
         except Exception as e:
+            print(f"💥 RAW ERROR: {repr(e)}", flush=True)
             if attempt == MAX_RETRIES - 1:
                 raise
             delay = RETRY_BASE_DELAY * (2 ** attempt)
-            logger.warning(
-                "API error (attempt %d/%d): %s — retrying in %ds",
-                attempt + 1, MAX_RETRIES, e, delay,
-            )
+            print(f"⚠️ Retrying in {delay}s...", flush=True)
             await asyncio.sleep(delay)
 
 
@@ -138,19 +153,13 @@ def trim_message_history(messages):
     ] + recent_part
 
 
-async def run_agent_loop(client, task_description, whiteboard_content="", user_memories="", on_step=None, replay_buffer=None, terminated=None, on_screenshot=None, on_checkpoint=None):
+async def run_agent_loop(client, task_description, whiteboard_content="", user_memories="", on_step=None, replay_buffer=None, terminated=None, on_screenshot=None, on_checkpoint=None, agent_type="orchestrator"):
     """
     Observe-think-act loop using Dedalus chat.completions.create().
-
-    Each turn:
-      1. Take a screenshot -> inject as a user message (image_url)
-      2. Model sees the desktop and returns a tool call
-      3. Execute the tool, loop back to 1
-
-    Returns the final summary when the model calls 'done'.
-    If `terminated` (asyncio.Event) is set, exits early.
     """
-    system_content = SYSTEM_PROMPT
+    print("🧠 ENTERED run_agent_loop", flush=True)
+    profile = AGENT_PROFILES.get(agent_type, AGENT_PROFILES["orchestrator"])
+    system_content = profile["prompt"]
     if whiteboard_content:
         system_content += (
             f"\n\nShared whiteboard (written by other agents):\n{whiteboard_content}"
@@ -170,8 +179,10 @@ async def run_agent_loop(client, task_description, whiteboard_content="", user_m
     for step in range(MAX_STEPS):
         # Check for termination between steps
         if terminated is not None and terminated.is_set():
-            logger.info("Terminated during task at step %d", step)
+            print(f"Terminated during task at step {step}", flush=True)
             return "(terminated by user)"
+
+        print(f"🚀 ENTERED AGENT LOOP TURN {step + 1}", flush=True)
 
         # Checkpoint: pause every CHECKPOINT_INTERVAL steps for Slack check-in
         if on_checkpoint and step > 0 and step % CHECKPOINT_INTERVAL == 0:
@@ -194,20 +205,39 @@ async def run_agent_loop(client, task_description, whiteboard_content="", user_m
         if on_screenshot is not None:
             await on_screenshot(raw_png)
 
-        # Exclude the 'done' tool for the first few steps to prevent premature completion
+        # Filter allowed tools for this sub-agent and exclude 'done' early on
+        allowed_tool_names = set(profile["tools"])
         if step < MIN_STEPS_BEFORE_DONE:
-            tools = [t for t in e2b_tools.TOOL_SCHEMAS if t["function"]["name"] != "done"]
-        else:
-            tools = e2b_tools.TOOL_SCHEMAS
+            allowed_tool_names.discard("done")
+            
+        tools = [t for t in e2b_tools.TOOL_SCHEMAS if t["function"]["name"] in allowed_tool_names]
 
-        response = await call_with_retry(
-            client,
-            model=MODEL,
-            messages=messages,
-            tools=tools,
-            tool_choice={"type": "any"},
-            max_tokens=2048,
-        )
+        # Emit "Thinking" state immediately with model info
+        if on_step:
+            await on_step(step + 1, "thinking", {}, f"Calling model {MODEL}...")
+
+        try:
+            print("🧠 BEFORE LLM...", flush=True)
+            response = await asyncio.wait_for(
+                call_with_retry(
+                    client,
+                    model=MODEL,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice={"type": "any"},
+                    max_tokens=2048,
+                ),
+                timeout=60.0  # Hard timeout for LLM reasoning
+            )
+            print("✅ AFTER LLM", flush=True)
+        except asyncio.TimeoutError:
+            print("❌ LLM TIMEOUT after 60s", flush=True)
+            if on_step:
+                await on_step(step + 1, "error", {"error": "LLM timeout"}, "Thinking took too long, retrying...")
+            continue
+        except Exception as e:
+            print(f"❌ LLM ERROR: {e}")
+            raise
 
         choice = response.choices[0]
         msg = choice.message
@@ -241,16 +271,17 @@ async def run_agent_loop(client, task_description, whiteboard_content="", user_m
                 reasoning = combined or None
 
         if not msg.tool_calls:
+            print("❌ No tool call from LLM", flush=True)
             no_tool_retries += 1
             if no_tool_retries >= 3:
                 logger.error("Model returned no tool calls %d times, giving up", no_tool_retries)
                 return msg.content or "(model failed to call tools)"
-            # Model returned no tool calls despite tool_choice — retry
-            # This can happen if the streaming response is incomplete
+            # Model returned no tool calls despite tool_choice — retry with a nudge
             logger.warning("No tool calls in response at step %d (retry %d/3)", step, no_tool_retries)
-            # Remove the assistant response and screenshot message (will re-add on next iteration)
-            messages.pop()  # assistant response
-            messages.pop()  # screenshot message
+            messages.append({
+                "role": "user",
+                "content": "You must use one of the provided tools to continue (e.g., click, type_text, or done if finished). Please respond with a tool call."
+            })
             continue
 
         # Got a valid tool call — reset retry counter
@@ -270,6 +301,11 @@ async def run_agent_loop(client, task_description, whiteboard_content="", user_m
         last_action_label = f"Tool: {name}"
 
         result = e2b_tools.execute_tool(name, args)
+
+        # Self-Correction Interceptor
+        if isinstance(result, str) and result.startswith("ERROR:"):
+            logger.warning(f"Self-correction triggered: Tool {name} returned an error.")
+            result += "\n\n[SYSTEM SELF-CORRECTION]: Your previous action failed. Do not blindly repeat it. Reassess the situation, try a different approach, or use the 'replan_strategy' or 'escalate_to_reviewer' tools."
 
         # If done, return the summary
         if name == "done":
@@ -297,19 +333,36 @@ async def main():
     sio = socketio.AsyncClient()
     await sio.connect(socket_url)
 
-    async def emit(event, data):
-        await sio.emit(event, {"sessionId": session_id, "agentId": agent_id, **data})
+    # --- Shared state for throttling ---
+    last_event_times = {}
 
-    # Join session room
-    await emit("agent:join", {})
+    async def emit(event, data):
+        # Throttle rapidly firing thinking/reasoning events
+        if event in ["agent:thinking", "agent:reasoning"]:
+            now = time.time() * 1000
+            last_time = last_event_times.get(event, 0)
+            if now - last_time < EVENT_THROTTLE_MS:
+                return # Skip this update
+            last_event_times[event] = now
+        
+        await sio.emit(event, {"sessionId": session_id, "agentId": agent_id, **data})
 
     # --- Register event handlers BEFORE booting sandbox ---
     task_queue = asyncio.Queue()
     terminated = asyncio.Event()
     force_kill = False
 
+    print("🔌 Connected to socket server", flush=True)
+    # Give the user immediate feedback that the worker has started
+    await emit("agent:thinking", {"action": "Initializing worker", "detail": "Starting secure sandbox environment..."})
+
+    @sio.on("disconnect")
+    async def on_disconnect():
+        print("🔌 Disconnected from socket server", flush=True)
+
     @sio.on("task:assign")
     async def on_task_assign(data):
+        print("📥 TASK RECEIVED:", data.get("taskId", "unknown"), flush=True)
         await task_queue.put(data)
 
     @sio.on("task:none")
@@ -333,26 +386,49 @@ async def main():
     async def on_checkpoint_resume(data=None):
         checkpoint_resume.set()
 
+    # Join session room (Handlers registered first to prevent race conditions)
+    await emit("agent:join", {})
+
     # --- Boot or reconnect E2B sandbox ---
     desktop = None
     reconnect_sandbox_id = os.environ.get("SANDBOX_ID")
     try:
         if reconnect_sandbox_id:
-            logger.info("Reconnecting to sandbox %s", reconnect_sandbox_id)
-            desktop = Sandbox(sandbox_id=reconnect_sandbox_id, timeout=3600)
-            desktop.stream.start()
-            stream_url = desktop.stream.get_url()
-            await emit("agent:stream_ready", {"streamUrl": stream_url})
-            logger.info("Reconnected to sandbox %s, stream at %s", reconnect_sandbox_id, stream_url)
-        else:
+            try:
+                print(f"🔄 Attempting to reconnect to sandbox {reconnect_sandbox_id}...", flush=True)
+                desktop = Sandbox(sandbox_id=reconnect_sandbox_id, timeout=3600)
+                desktop.stream.start()
+                stream_url = desktop.stream.get_url()
+                await emit("agent:stream_ready", {"streamUrl": stream_url})
+                print(f"✅ Reconnected to sandbox {reconnect_sandbox_id}", flush=True)
+            except Exception as e:
+                print(f"⚠️ Reconnection failed (sandbox probably expired): {e}. Spawning new sandbox...", flush=True)
+                desktop = None # Fall through to creation logic
+        
+        if not desktop:
+            # Pass resolution to reduce streaming overhead on low-tier infra
+            # Typically supported via kargs in newer e2b-desktop or environmental overrides
+            # We'll try to set the resolution here
             desktop = Sandbox.create(timeout=3600)
+            
+            # Fallback: force resolution via xrandr inside the sandbox if needed
+            try:
+                desktop.run_command("xrandr --size 1280x720")
+            except:
+                pass
+            # Immediate stream start - don't wait for anything else
             desktop.stream.start()
-            stream_url = desktop.stream.get_url()
+            
+            # Emit sandbox_ready IMMEDIATELY
             await emit("agent:sandbox_ready", {"sandboxId": desktop.sandbox_id})
+            
+            print(f"✅ Sandbox created: {desktop.sandbox_id}. Initializing stream...", flush=True)
+            stream_url = desktop.stream.get_url()
             await emit("agent:stream_ready", {"streamUrl": stream_url})
-            logger.info("Sandbox booted (id=%s), stream at %s", desktop.sandbox_id, stream_url)
+            print(f"✅ Stream active at {stream_url}", flush=True)
+            
     except Exception as e:
-        logger.error("Failed to boot/reconnect sandbox: %s", e)
+        print(f"❌ CRITICAL ERROR: Failed to boot/reconnect sandbox: {e}", flush=True)
         if reconnect_sandbox_id:
             await emit("agent:sandbox_expired", {})
         else:
@@ -364,7 +440,10 @@ async def main():
     e2b_tools.init(desktop)
 
     # --- Init Daedalus client ---
-    client = AsyncDedalus()
+    dedalus_api_key = os.environ.get("DEDALUS_API_KEY")
+    if not dedalus_api_key:
+        print("❌ CRITICAL ERROR: DEDALUS_API_KEY is not set in environment!", flush=True)
+    client = AsyncDedalus(api_key=dedalus_api_key)
 
     # --- Replay buffer ---
     replay_buffer = ReplayBuffer()
@@ -426,21 +505,27 @@ async def main():
         while not terminated.is_set():
             # Wait for a task or termination signal
             try:
-                task_data = await asyncio.wait_for(task_queue.get(), timeout=2.0)
+                task_data = await asyncio.wait_for(task_queue.get(), timeout=5.0)
             except asyncio.TimeoutError:
                 if terminated.is_set():
                     break
+                print("⏳ Waiting for task...", flush=True)
                 continue
 
             task_id = task_data["taskId"]
             task_description = task_data["description"]
+            agent_type = task_data.get("agent_type", "orchestrator")
             whiteboard_content = task_data.get("whiteboard", "")
 
+            print("🔥 EXECUTION TRIGGERED", flush=True)
+            # Immediate feedback that worker is starting
+            await emit("agent:thinking", {"action": "Agent started execution", "detail": task_description})
+            
             await emit(
                 "agent:thinking",
                 {"action": "Starting task", "detail": task_description},
             )
-            logger.info("Starting task %s: %s", task_id, task_description)
+            logger.info("🚀 Agent execution started for task %s: %s", task_id, task_description)
 
             # Retrieve user memories for context
             user_memories = ""
@@ -496,6 +581,8 @@ async def main():
                     return "terminated"
                 return "continue"
 
+            # Execute the loop
+            print(f"🚀 Execution started: {task_id[:8]}", flush=True)
             try:
                 result = await run_agent_loop(
                     client, task_description,
@@ -506,6 +593,7 @@ async def main():
                     terminated=terminated,
                     on_screenshot=on_screenshot,
                     on_checkpoint=on_checkpoint if is_slack_session else None,
+                    agent_type=agent_type,
                 )
             except (ConnectionError, TimeoutError, OSError) as e:
                 # E2B sandbox expired or connection lost
@@ -522,6 +610,7 @@ async def main():
                 logger.error("Task %s failed: %s", task_id, e)
 
             # Report task completion
+            print(f"✅ Task finished: {task_id[:8]}", flush=True)
             await emit(
                 "task:completed", {"todoId": task_id, "result": result}
             )

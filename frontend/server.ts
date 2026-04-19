@@ -225,6 +225,7 @@ app.prepare().then(() => {
       if (agent.status !== "terminated") {
         updateAgentStatus(sessionId, agent.id, "terminated");
         io.to(`session:${sessionId}`).emit("agent:terminated", {
+          sessionId,
           agentId: agent.id,
         });
       }
@@ -273,6 +274,7 @@ app.prepare().then(() => {
       // Send task to the specific worker socket
       const whiteboard = getWhiteboard(sessionId);
       const room = `session:${sessionId}`;
+      console.log(`[server] Assigning task ${nextTask.id} to agent ${agent.id}`);
       io.to(room).emit("task:assign", {
         taskId: nextTask.id,
         description: nextTask.description,
@@ -422,24 +424,27 @@ app.prepare().then(() => {
     socket.on("agent:join", (data: AgentJoinEvent) => {
       const { sessionId, agentId } = data;
       socket.join(`session:${sessionId}`);
-      console.log(`[socket.io] Worker ${agentId} joined session:${sessionId}`);
+      socket.join(`agent:${agentId}`);
+      console.log(`[socket.io] Worker ${agentId} joined session:${sessionId} and agent:${agentId}`);
 
       // Forward to browser clients
       const room = `session:${sessionId}`;
       io.to(room).emit("agent:join", { agentId, sessionId });
+      console.log(`[socket.io] Forwarded agent:join for ${agentId} to session room ${room}`);
     });
 
     socket.on("agent:stream_ready", (data: AgentStreamReadyEvent) => {
-      // Find session from rooms
-      const sessionId = findSessionId(socket);
-      if (!sessionId) return;
-
-      const { agentId, streamUrl } = data;
+      const { sessionId, agentId, streamUrl } = data;
+      if (!sessionId) {
+        console.error("[server] agent:stream_ready missing sessionId", data);
+        return;
+      }
       updateAgentStreamUrl(sessionId, agentId, streamUrl);
       updateAgentStatus(sessionId, agentId, "active");
 
       // Forward to browser clients
       io.to(`session:${sessionId}`).emit("agent:stream_ready", {
+        sessionId,
         agentId,
         streamUrl,
       });
@@ -452,23 +457,34 @@ app.prepare().then(() => {
           todoId: nextTask.id,
           agentId,
         });
-
-        // Send task to worker
+        
+        console.log(`[server] Assigning initial task ${nextTask.id} to agent ${agentId} via room agent:${agentId}`);
+        // Send task to worker in its specific room
         const whiteboard = getWhiteboard(sessionId);
-        socket.emit("task:assign", {
+        
+        // Double check room join before emitting
+        if (!socket.rooms.has(`agent:${agentId}`)) {
+          console.warn(`[server] ⚠️ Socket ${socket.id} not yet in room agent:${agentId}, re-joining`);
+          socket.join(`agent:${agentId}`);
+        }
+        
+        io.to(`agent:${agentId}`).emit("task:assign", {
           taskId: nextTask.id,
           description: nextTask.description,
           whiteboard,
         });
+      } else {
+        console.warn(`[server] ⚠️ No pending tasks for agent ${agentId} on stream_ready`);
       }
       // Agent idles if no pending tasks — don't terminate
     });
 
     socket.on("agent:thinking", (data: AgentThinkingEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId } = data;
       if (!sessionId) return;
 
       io.to(`session:${sessionId}`).emit("agent:thinking", {
+        sessionId,
         agentId: data.agentId,
         action: data.action,
         timestamp: data.timestamp || new Date().toISOString(),
@@ -509,7 +525,7 @@ app.prepare().then(() => {
     });
 
     socket.on("agent:reasoning", (data: AgentReasoningEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId } = data;
       if (!sessionId) return;
 
       // Buffer reasoning in ring buffer (last 5) for checkpoint summaries
@@ -527,6 +543,7 @@ app.prepare().then(() => {
       }
 
       io.to(`session:${sessionId}`).emit("agent:reasoning", {
+        sessionId,
         agentId: data.agentId,
         reasoning: data.reasoning,
         timestamp: data.timestamp || new Date().toISOString(),
@@ -535,7 +552,7 @@ app.prepare().then(() => {
     });
 
     socket.on("agent:thumbnail", (data: AgentThumbnailEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId } = data;
       if (!sessionId) return;
 
       updateAgentThumbnail(sessionId, data.agentId, data.thumbnail);
@@ -548,10 +565,8 @@ app.prepare().then(() => {
     });
 
     socket.on("agent:sandbox_ready", (data: AgentSandboxReadyEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId, agentId, sandboxId } = data;
       if (!sessionId) return;
-
-      const { agentId, sandboxId } = data;
       updateAgentSandboxId(sessionId, agentId, sandboxId);
       persistAgentSandboxId(agentId, sandboxId).catch(console.error);
       console.log(`[socket.io] Agent ${agentId} sandbox ready: ${sandboxId}`);
@@ -563,14 +578,12 @@ app.prepare().then(() => {
     });
 
     socket.on("agent:paused", (data: AgentPausedEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId, agentId, sandboxId } = data;
       if (!sessionId) return;
-
-      const { agentId, sandboxId } = data;
       updateAgentStatus(sessionId, agentId, "paused");
       updateAgentSandboxId(sessionId, agentId, sandboxId);
       persistAgentSandboxId(agentId, sandboxId).catch(console.error);
-      io.to(`session:${sessionId}`).emit("agent:paused", { agentId, sandboxId });
+      io.to(`session:${sessionId}`).emit("agent:paused", { sessionId, agentId, sandboxId });
 
       // If all agents are paused, pause the session
       const session = getSession(sessionId);
@@ -582,17 +595,15 @@ app.prepare().then(() => {
     });
 
     socket.on("agent:sandbox_expired", (data: AgentSandboxExpiredEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId, agentId } = data;
       if (!sessionId) return;
-
-      const { agentId } = data;
       updateAgentStatus(sessionId, agentId, "expired");
-      io.to(`session:${sessionId}`).emit("agent:sandbox_expired", { agentId });
+      io.to(`session:${sessionId}`).emit("agent:sandbox_expired", { sessionId, agentId });
       console.log(`[server] Agent ${agentId} sandbox expired`);
     });
 
     socket.on("agent:checkpoint", (data: AgentCheckpointEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId } = data;
       if (!sessionId) return;
 
       const slackSession = getSlackSessionBySessionId(sessionId);
@@ -615,35 +626,44 @@ app.prepare().then(() => {
         data.thumbnail,
         accomplishmentSummary,
       ).catch(console.error);
+
+      // Forward to browser clients (Panopticon/Demo UI)
+      io.to(`session:${sessionId}`).emit("agent:checkpoint", {
+        sessionId,
+        agentId: data.agentId,
+        step: data.step,
+        totalSteps: data.totalSteps,
+        thumbnail: data.thumbnail,
+      });
     });
 
     socket.on("agent:error", (data: AgentErrorEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId, agentId, error } = data;
       if (!sessionId) return;
 
-      updateAgentStatus(sessionId, data.agentId, "error");
+      updateAgentStatus(sessionId, agentId, "error");
       io.to(`session:${sessionId}`).emit("agent:error", {
-        agentId: data.agentId,
-        error: data.error,
+        sessionId,
+        agentId,
+        error,
       });
 
       // Post error to Slack for human-in-the-loop recovery
       if (getSlackSessionBySessionId(sessionId)) {
-        postErrorToSlack(sessionId, data.error).catch(console.error);
+        postErrorToSlack(sessionId, error).catch(console.error);
       }
     });
 
     socket.on("task:completed", (data: TaskCompletedEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId, todoId, agentId, result } = data;
       if (!sessionId) return;
-
-      const { todoId, agentId, result } = data;
       completeTask(sessionId, todoId, result);
 
       // Persist todo completion to database
       persistTodoStatus(todoId, "completed", result).catch(console.error);
 
       io.to(`session:${sessionId}`).emit("task:completed", {
+        sessionId,
         todoId,
         agentId,
         result,
@@ -675,7 +695,8 @@ app.prepare().then(() => {
         });
 
         const whiteboard = getWhiteboard(sessionId);
-        socket.emit("task:assign", {
+        console.log(`[server] Assigning next task ${nextTask.id} to agent ${agentId} via room agent:${agentId}`);
+        io.to(`agent:${agentId}`).emit("task:assign", {
           taskId: nextTask.id,
           description: nextTask.description,
           whiteboard,
@@ -716,7 +737,7 @@ app.prepare().then(() => {
     });
 
     socket.on("whiteboard:updated", (data: WhiteboardUpdatedEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId } = data;
       if (!sessionId) return;
 
       // Append to whiteboard (agents append, not overwrite)
@@ -731,10 +752,8 @@ app.prepare().then(() => {
     });
 
     socket.on("replay:complete", async (data: ReplayCompleteEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId, agentId, manifestUrl, frameCount } = data;
       if (!sessionId) return;
-
-      const { agentId, manifestUrl, frameCount } = data;
       console.log(
         `[server] Session ${sessionId} — replay uploaded for agent ${agentId} (${frameCount} frames)`
       );
@@ -778,11 +797,12 @@ app.prepare().then(() => {
     });
 
     socket.on("agent:terminated", (data: AgentTerminatedEvent) => {
-      const sessionId = findSessionId(socket);
+      const { sessionId, agentId } = data;
       if (!sessionId) return;
 
-      updateAgentStatus(sessionId, data.agentId, "terminated");
+      updateAgentStatus(sessionId, agentId, "terminated");
       io.to(`session:${sessionId}`).emit("agent:terminated", {
+        sessionId,
         agentId: data.agentId,
       });
 
